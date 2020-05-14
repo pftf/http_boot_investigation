@@ -1,0 +1,115 @@
+From 4a4b4ca935e73702e77c9b918360fd79cb0aca74 Mon Sep 17 00:00:00 2001
+From: Andrei Warkentin <andrey.warkentin@gmail.com>
+Date: Wed, 13 May 2020 23:22:56 -0700
+Subject: [PATCH] HttpBoot: handle servers which may FIN after file sizing in
+ HttpBootLoadFile
+
+Python http.server seems to FIN after the first HEAD request to size
+the loaded file is completed and ACKed. What happens next is interesting.
+On low latency connections, the GET request to download may get sent
+after the server sends the FIN but before the client has a chance to
+process it. The net result is:
+- Server ignores GET
+- HttpBootLoadFile returns EFI_CONNECTION_FIN. Boot fails.
+
+In the other case, client handles the FIN before attempting the GET,
+so there's a proper three-way handshake as part of GET.
+
+The solution is to retry HttpBootLoadFile 2 times if it returns
+EFI_CONNECTION_FIN. This is because HttpBootLoadFile may issue up to
+3 requests: HEAD/GET to get size and final GET to load. Some servers
+may send a FIN after each request. The first request (HEAD) is not
+supposed to fail this way, so only the two subsequent GET request
+may result in a FIN.
+
+Signed-off-by: Andrei Warkentin <andrey.warkentin@gmail.com>
+---
+ NetworkPkg/HttpBootDxe/HttpBootImpl.c | 27 ++++++++++++++++++++++++++-
+ NetworkPkg/HttpDxe/HttpImpl.c         |  5 +++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/NetworkPkg/HttpBootDxe/HttpBootImpl.c b/NetworkPkg/HttpBootDxe/HttpBootImpl.c
+index 4a51f35cdd..2d74d5f293 100644
+--- a/NetworkPkg/HttpBootDxe/HttpBootImpl.c
++++ b/NetworkPkg/HttpBootDxe/HttpBootImpl.c
+@@ -288,6 +288,7 @@ HttpBootDhcp (
+   @retval EFI_NOT_STARTED             The driver is in stopped state.
+   @retval EFI_BUFFER_TOO_SMALL        The BufferSize is too small to read the boot file. BufferSize has
+                                       been updated with the size needed to complete the request.
++  @retval EFI_CONNECTION_FIN          Server had closed the connection while we were waiting downloading.
+   @retval EFI_DEVICE_ERROR            An unexpected network error occurred.
+   @retval Others                      Other errors as indicated.
+ 
+@@ -535,6 +536,7 @@ HttpBootStop (
+   @retval EFI_BUFFER_TOO_SMALL  The BufferSize is too small to read the current directory entry.
+                                 BufferSize has been updated with the size needed to complete
+                                 the request.
++  @retval EFI_CONNECTION_FIN    Server had closed the connection while we were waiting for a response.
+ 
+ **/
+ EFI_STATUS
+@@ -553,6 +555,7 @@ HttpBootDxeLoadFile (
+   BOOLEAN                       UsingIpv6;
+   EFI_STATUS                    Status;
+   HTTP_BOOT_IMAGE_TYPE          ImageType;
++  UINTN                         MaxTries;
+ 
+   if (This == NULL || BufferSize == NULL || FilePath == NULL) {
+     return EFI_INVALID_PARAMETER;
+@@ -598,7 +601,29 @@ HttpBootDxeLoadFile (
+   // Load the boot file.
+   //
+   ImageType = ImageTypeMax;
+-  Status = HttpBootLoadFile (Private, BufferSize, Buffer, &ImageType);
++  //
++  // HttpBootLoadFile may issue up to 2 requests: HEAD/GET to get
++  // size and final GET to load. Some servers may send a FIN after
++  // each request. The first request (HEAD) is not supposed to
++  // fail this way, so only the two possible GETs need the special
++  // handling.
++  //
++  MaxTries = 2;
++  do {
++    Status = HttpBootLoadFile (Private, BufferSize, Buffer, &ImageType);
++    if (Status == EFI_CONNECTION_FIN) {
++      if (Private->HttpCreated) {
++        //
++        // Tear down HTTP/TCP state entirely. Http->Configure (NULL) is not
++        // sufficient (EFI_ACCESS_DENIED from TCP stack on subsequent
++        // HttpBootLoadFile.
++        //
++        HttpIoDestroyIo (&Private->HttpIo);
++        Private->HttpCreated = FALSE;
++      }
++    }
++  } while (MaxTries-- && Status == EFI_CONNECTION_FIN);
++
+   if (EFI_ERROR (Status)) {
+     if (Status == EFI_BUFFER_TOO_SMALL && (ImageType == ImageTypeVirtualCd || ImageType == ImageTypeVirtualDisk)) {
+       Status = EFI_WARN_FILE_SYSTEM;
+diff --git a/NetworkPkg/HttpDxe/HttpImpl.c b/NetworkPkg/HttpDxe/HttpImpl.c
+index 5a6ecbc9d9..34a33b09f7 100644
+--- a/NetworkPkg/HttpDxe/HttpImpl.c
++++ b/NetworkPkg/HttpDxe/HttpImpl.c
+@@ -959,6 +959,8 @@ HttpBodyParserCallback (
+   @retval EFI_OUT_OF_RESOURCES    Failed to complete the operation due to lack of resources.
+   @retval EFI_NOT_READY           Can't find a corresponding Tx4Token/Tx6Token or
+                                   the EFI_HTTP_UTILITIES_PROTOCOL is not available.
++  @retval EFI_CONNECTION_FIN      Server had closed the connection while we were waiting for
++                                  a response.
+ 
+ **/
+ EFI_STATUS
+@@ -1528,6 +1530,9 @@ Error:
+   @retval EFI_OUT_OF_RESOURCES    Could not allocate enough system resources.
+   @retval EFI_ACCESS_DENIED       An open TCP connection is not present with the host
+                                   specified by response URL.
++
++  @retval EFI_CONNECTION_FIN      Server had closed the connection while we were waiting for
++                                  a response.
+ **/
+ EFI_STATUS
+ EFIAPI
+-- 
+2.17.1
+
