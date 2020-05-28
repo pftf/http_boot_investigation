@@ -1,10 +1,8 @@
-From 68abf1778dca678619f339137566c5c310d16b46 Mon Sep 17 00:00:00 2001
+From 4a4b4ca935e73702e77c9b918360fd79cb0aca74 Mon Sep 17 00:00:00 2001
 From: Andrei Warkentin <andrey.warkentin@gmail.com>
 Date: Wed, 13 May 2020 23:22:56 -0700
-Subject: [edk2][PATCH 1/1] NetworkPkg/HttpBootDxe: handle servers which may
- FIN after file sizing in HttpBootLoadFile
-
-This is v2 with Maciej Rabeda's feedback.
+Subject: [PATCH] HttpBoot: handle servers which may FIN after file sizing in
+ HttpBootLoadFile
 
 Python http.server seems to FIN after the first HEAD request to size
 the loaded file is completed and ACKed. What happens next is interesting.
@@ -24,31 +22,14 @@ may send a FIN after each request. The first request (HEAD) is not
 supposed to fail this way, so only the two subsequent GET request
 may result in a FIN.
 
-Fixes https://bugzilla.tianocore.org/show_bug.cgi?id=2720
-
-This what the boot looks like now (when using that Python server):
->>Start HTTP Boot over IPv4....
-  Station IP address is 10.0.1.186
-
-  URI: http://10.0.1.57/bootaa64.efi
-
- Error: Server has terminated the connection.
-
-  URI: http://10.0.1.57/bootaa64.efi
-  File Size: 179160 Bytes
-  Downloading...100%
-
-Cc: Maciej Rabeda <maciej.rabeda@linux.intel.com>
-Cc: Jiaxin Wu <jiaxin.wu@intel.com>
-Cc: Siyuan Fu <siyuan.fu@intel.com>
 Signed-off-by: Andrei Warkentin <andrey.warkentin@gmail.com>
 ---
- NetworkPkg/HttpBootDxe/HttpBootImpl.c | 35 +++++++++++++++++++-
- NetworkPkg/HttpDxe/HttpImpl.c         |  5 +++
- 2 files changed, 39 insertions(+), 1 deletion(-)
+ NetworkPkg/HttpBootDxe/HttpBootImpl.c | 27 ++++++++++++++++++++++++++-
+ NetworkPkg/HttpDxe/HttpImpl.c         |  5 +++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/NetworkPkg/HttpBootDxe/HttpBootImpl.c b/NetworkPkg/HttpBootDxe/HttpBootImpl.c
-index 4a51f35cdd..1a251b4347 100644
+index 4a51f35cdd..2d74d5f293 100644
 --- a/NetworkPkg/HttpBootDxe/HttpBootImpl.c
 +++ b/NetworkPkg/HttpBootDxe/HttpBootImpl.c
 @@ -288,6 +288,7 @@ HttpBootDhcp (
@@ -59,16 +40,15 @@ index 4a51f35cdd..1a251b4347 100644
    @retval EFI_DEVICE_ERROR            An unexpected network error occurred.
    @retval Others                      Other errors as indicated.
  
-@@ -408,6 +409,8 @@ ON_EXIT:
-       AsciiPrint ("\n  Error: Server response timeout.\n");
-     } else if (Status == EFI_ABORTED) {
-       AsciiPrint ("\n  Error: Remote boot cancelled.\n");
-+    } else if (Status == EFI_CONNECTION_FIN) {
-+      AsciiPrint ("\n Error: Server has terminated the connection.\n");
-     } else if (Status != EFI_BUFFER_TOO_SMALL) {
-       AsciiPrint ("\n  Error: Unexpected network error.\n");
-     }
-@@ -553,6 +556,7 @@ HttpBootDxeLoadFile (
+@@ -535,6 +536,7 @@ HttpBootStop (
+   @retval EFI_BUFFER_TOO_SMALL  The BufferSize is too small to read the current directory entry.
+                                 BufferSize has been updated with the size needed to complete
+                                 the request.
++  @retval EFI_CONNECTION_FIN    Server had closed the connection while we were waiting for a response.
+ 
+ **/
+ EFI_STATUS
+@@ -553,6 +555,7 @@ HttpBootDxeLoadFile (
    BOOLEAN                       UsingIpv6;
    EFI_STATUS                    Status;
    HTTP_BOOT_IMAGE_TYPE          ImageType;
@@ -76,7 +56,7 @@ index 4a51f35cdd..1a251b4347 100644
  
    if (This == NULL || BufferSize == NULL || FilePath == NULL) {
      return EFI_INVALID_PARAMETER;
-@@ -598,13 +602,42 @@ HttpBootDxeLoadFile (
+@@ -598,7 +601,29 @@ HttpBootDxeLoadFile (
    // Load the boot file.
    //
    ImageType = ImageTypeMax;
@@ -107,19 +87,6 @@ index 4a51f35cdd..1a251b4347 100644
    if (EFI_ERROR (Status)) {
      if (Status == EFI_BUFFER_TOO_SMALL && (ImageType == ImageTypeVirtualCd || ImageType == ImageTypeVirtualDisk)) {
        Status = EFI_WARN_FILE_SYSTEM;
-     } else if (Status != EFI_BUFFER_TOO_SMALL) {
-       HttpBootStop (Private);
-     }
-+    if (Status == EFI_CONNECTION_FIN) {
-+      //
-+      // EFI_CONNECTION_FIN is not an expected error for EFI_LOAD_FILE_PROTOCOL.LoadFile(), so
-+      // map it to closest matching error. Note: already logged the error in HttpBootLoadFile.
-+      //
-+      Status = EFI_ABORTED;
-+    }
-     return Status;
-   }
- 
 diff --git a/NetworkPkg/HttpDxe/HttpImpl.c b/NetworkPkg/HttpDxe/HttpImpl.c
 index 5a6ecbc9d9..34a33b09f7 100644
 --- a/NetworkPkg/HttpDxe/HttpImpl.c
